@@ -1,0 +1,152 @@
+% qos_flowcontrol_fixed.m
+% Simple discrete-event-ish time-stepped simulation:
+% - Poisson packet arrivals (exponential interarrival times)
+% - Token Bucket policing (bit-based)
+% - FIFO queue with link service rate (bits/sec)
+% - Computes throughput, loss ratio, avg delay, and plots
+clear; close all; clc; 
+%% PARAMETERS (change these to experiment)
+N_packets = 1000; % number of packet arrivals to simulate
+lambda = 80; % arrival rate (packets/sec) (Poisson process)
+avg_pkt_bytes = 1000; % average packet size in bytes
+pkt_size_var = 0.4; % CV for size variability (0 => fixed)
+link_capacity = 1e6; % link capacity in bits/sec (1 Mbps)
+token_rate_bps = 600000; % policing token generation rate in bits/sec
+bucket_bits = avg_pkt_bytes*8*10; % bucket capacity in bits (e.g., 10 
+packets)
+dt = 1e-4; % simulation time step (sec) -- small for 
+accuracy
+%% Generate arrivals
+rng(1); % for reproducibility
+inter_arrivals = -log(rand(N_packets,1)) / lambda; 
+arrival_times = cumsum(inter_arrivals); 
+% Packet sizes: vary around avg with random factor
+pkt_sizes_bytes = max(64, round(avg_pkt_bytes .* (1 + 
+pkt_size_var*(randn(N_packets,1))))); 
+pkt_sizes_bits = pkt_sizes_bytes * 8; 
+sim_end_time = arrival_times(end) + 5; % run a little after last arrival
+time = 0:dt:sim_end_time; 
+T = length(time); 
+%% Simulation state variables
+queue_bits = 0; % bits currently queued
+token_level = bucket_bits; % start full
+next_arrival_idx = 1; 
+% Bookkeeping arrays
+queue_len_bits_trace = zeros(T,1); 
+tokens_trace = zeros(T,1); 
+accepted = false(N_packets,1); 
+arrival_time_pkt = NaN(N_packets,1); 
+depart_time_pkt = NaN(N_packets,1); 
+% Queue bookkeeping: store sizes and the original packet index for mapping
+9
+queued_pkt_sizes = zeros(N_packets,1); 
+queued_pkt_indices = zeros(N_packets,1); 
+q_head = 1; 
+q_tail = 0; 
+link_service_rem_bits = 0; % remaining bits of head packet being transmitted
+for ti = 1:T 
+ t = time(ti); 
+ % generate tokens (continuous)
+ token_level = min(bucket_bits, token_level + token_rate_bps*dt); 
+ 
+ % handle arrivals that occur up to current time t
+ while next_arrival_idx <= N_packets && arrival_times(next_arrival_idx) <= t 
+ idx_pkt = next_arrival_idx; 
+ sz = pkt_sizes_bits(idx_pkt); 
+ arrival_time_pkt(idx_pkt) = arrival_times(idx_pkt); 
+ % Token-bucket policing: if enough tokens -> conforming
+ if token_level >= sz 
+ % conforming: tokens are consumed, packet enters queue
+ token_level = token_level - sz; 
+ q_tail = q_tail + 1; 
+ queued_pkt_sizes(q_tail) = sz; 
+ queued_pkt_indices(q_tail) = idx_pkt; % record original index
+ accepted(idx_pkt) = true; 
+ queue_bits = queue_bits + sz; 
+ else
+ % non-conforming: drop (mark as not accepted)
+ accepted(idx_pkt) = false; 
+ end
+ next_arrival_idx = next_arrival_idx + 1; 
+ end
+ 
+ % link transmits bits up to link_capacity*dt
+ budget = link_capacity * dt; 
+ while budget > 0 && q_head <= q_tail 
+ if link_service_rem_bits == 0 
+ link_service_rem_bits = queued_pkt_sizes(q_head); 
+ end
+ take = min(budget, link_service_rem_bits); 
+ link_service_rem_bits = link_service_rem_bits - take; 
+ budget = budget - take; 
+ queue_bits = queue_bits - take; 
+ % if the head packet finished transmitting, record departure time
+ if link_service_rem_bits == 0 
+ orig_idx = queued_pkt_indices(q_head); 
+ if orig_idx > 0 
+ depart_time_pkt(orig_idx) = t; % exact current simulation time
+ end
+ q_head = q_head + 1; 
+ end
+10
+ end
+ 
+ queue_len_bits_trace(ti) = queue_bits; 
+ tokens_trace(ti) = token_level; 
+end
+%% Metrics (only for packets that were accepted AND actually departed)
+total = N_packets; 
+num_accepted = sum(accepted); 
+num_dropped = total - num_accepted; 
+% Consider only accepted packets that actually departed (some may still be in 
+queue)
+valid_departed = accepted & ~isnan(depart_time_pkt); 
+num_departed = sum(valid_departed); 
+sim_duration = time(end); % total simulated time
+throughput_bps = sum(pkt_sizes_bits(valid_departed)) / sim_duration; 
+loss_ratio = num_dropped / total; 
+% Delay for departed accepted packets: departure - arrival
+delays = depart_time_pkt(valid_departed) - arrival_time_pkt(valid_departed); % 
+seconds
+if isempty(delays) 
+ avg_delay = NaN; 
+ p50 = NaN; 
+ p95 = NaN; 
+else
+ avg_delay = mean(delays); 
+ p50 = prctile(delays,50); 
+ p95 = prctile(delays,95); 
+end
+%% Print summary
+fprintf('--- Simulation summary ---\n'); 
+fprintf('Total packets simulated: %d\n', total); 
+fprintf('Accepted (conforming) : %d\n', num_accepted); 
+fprintf('Dropped (non-conforming): %d\n', num_dropped); 
+fprintf('Departed (transmitted) : %d\n', num_departed); 
+fprintf('Loss ratio: %.3f%%\n', loss_ratio*100); 
+fprintf('Throughput: %.1f kbps\n', throughput_bps/1e3); 
+if ~isnan(avg_delay) 
+ fprintf('Avg delay (accepted & departed): %.3f ms (median %.3f ms, 95th %.3f 
+ms)\n', avg_delay*1000, p50*1000, p95*1000); 
+else
+ fprintf('No departed accepted packets to compute delay statistics.\n'); 
+end
+%% Plots
+figure('Position',[100 100 900 600]); 
+11
+subplot(3,1,1); 
+plot(time, queue_len_bits_trace/8); ylabel('Queue length (bytes)'); xlabel('Time 
+(s)'); 
+title('Queue length over time'); 
+subplot(3,1,2); 
+plot(time, tokens_trace/8); ylabel('Tokens (bytes)'); xlabel('Time (s)'); 
+title('Token bucket level over time'); 
+subplot(3,1,3); 
+if ~isempty(delays) 
+ histogram(delays*1000, 40); 
+ xlabel('Delay (ms)'); ylabel('Count'); 
+ title('Delay distribution (accepted & departed packets)'); 
+else
+ text(0.1,0.5,'No delay data (no departed accepted packets)','FontSize',12); 
+ axis off; 
+end 
